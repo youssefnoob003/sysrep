@@ -366,38 +366,59 @@
         </div>
 
         <!-- User Cards -->
-        <div class="users-grid">
-            <div class="user-card" id="card-alice">
-                <div class="user-avatar">A</div>
-                <div class="user-name">Alice</div>
-                <div class="user-port">→ Random node</div>
-                <button class="buy-btn" id="btn-alice" onclick="buyTicket('Alice')">🎟️ Buy Ticket</button>
-                <div class="user-result" id="result-alice"></div>
-            </div>
-            <div class="user-card" id="card-bob">
-                <div class="user-avatar">B</div>
-                <div class="user-name">Bob</div>
-                <div class="user-port">→ Random node</div>
-                <button class="buy-btn" id="btn-bob" onclick="buyTicket('Bob')">🎟️ Buy Ticket</button>
-                <div class="user-result" id="result-bob"></div>
-            </div>
-            <div class="user-card" id="card-alex">
-                <div class="user-avatar">X</div>
-                <div class="user-name">Alex</div>
-                <div class="user-port">→ Random node</div>
-                <button class="buy-btn" id="btn-alex" onclick="buyTicket('Alex')">🎟️ Buy Ticket</button>
-                <div class="user-result" id="result-alex"></div>
-            </div>
+        <div class="users-grid" id="users-container">
+            {% if more_users %}
+                {% for i in range(1, 31) %}
+                <div class="user-card" id="card-user{{ i }}">
+                    <div class="user-avatar" style="background: hsl({{ i * 12 }}, 70%, 60%)">{{ i }}</div>
+                    <div class="user-name">User {{ i }}</div>
+                    <div class="user-port">→ Random node</div>
+                    <button class="buy-btn" id="btn-user{{ i }}" onclick="buyTicket('User {{ i }}')">🎟️ Buy Ticket</button>
+                    <div class="user-result" id="result-user{{ i }}"></div>
+                </div>
+                {% endfor %}
+            {% else %}
+                <div class="user-card" id="card-alice">
+                    <div class="user-avatar">A</div>
+                    <div class="user-name">Alice</div>
+                    <div class="user-port">→ Random node</div>
+                    <button class="buy-btn" id="btn-alice" onclick="buyTicket('Alice')">🎟️ Buy Ticket</button>
+                    <div class="user-result" id="result-alice"></div>
+                </div>
+                <div class="user-card" id="card-bob">
+                    <div class="user-avatar">B</div>
+                    <div class="user-name">Bob</div>
+                    <div class="user-port">→ Random node</div>
+                    <button class="buy-btn" id="btn-bob" onclick="buyTicket('Bob')">🎟️ Buy Ticket</button>
+                    <div class="user-result" id="result-bob"></div>
+                </div>
+                <div class="user-card" id="card-alex">
+                    <div class="user-avatar">X</div>
+                    <div class="user-name">Alex</div>
+                    <div class="user-port">→ Random node</div>
+                    <button class="buy-btn" id="btn-alex" onclick="buyTicket('Alex')">🎟️ Buy Ticket</button>
+                    <div class="user-result" id="result-alex"></div>
+                </div>
+            {% endif %}
         </div>
 
         <!-- Action Buttons -->
         <div class="actions">
+            {% if more_users %}
+            <button class="disaster-btn" id="disaster-btn" onclick="simulateDisasterMore()">
+                💥 Simulate Load — Fire 30 Users Simultaneously
+            </button>
+            <button class="reset-btn" id="reset-btn" onclick="resetDatabaseMore()">
+                🔄 Reset DB to 30
+            </button>
+            {% else %}
             <button class="disaster-btn" id="disaster-btn" onclick="simulateDisaster()">
                 💥 Simulate Disaster — Fire All 3 Simultaneously
             </button>
             <button class="reset-btn" id="reset-btn" onclick="resetDatabase()">
                 🔄 Reset DB to 1
             </button>
+            {% endif %}
         </div>
 
         <!-- Log Console -->
@@ -434,11 +455,23 @@
         }
 
         function clearResults() {
+            {% if more_users %}
+            for (let i = 1; i <= 30; i++) {
+                const el = document.getElementById(`result-user${i}`);
+                if (el) {
+                    el.className = 'user-result';
+                    el.textContent = '';
+                }
+            }
+            {% else %}
             ['alice', 'bob', 'alex'].forEach(name => {
                 const el = document.getElementById(`result-${name}`);
-                el.className = 'user-result';
-                el.textContent = '';
+                if (el) {
+                    el.className = 'user-result';
+                    el.textContent = '';
+                }
             });
+            {% endif %}
         }
 
         // ─── Refresh Ticket Count ───
@@ -458,13 +491,15 @@
 
         // ─── Buy Ticket (single user) ───
         async function buyTicket(name) {
-            const btn = document.getElementById(`btn-${name.toLowerCase()}`);
-            const resultEl = document.getElementById(`result-${name.toLowerCase()}`);
+            let nameId = name.toLowerCase().replace(" ", "");
+            const btn = document.getElementById(`btn-${nameId}`);
+            const resultEl = document.getElementById(`result-${nameId}`);
             btn.disabled = true;
             resultEl.className = 'user-result pending';
             resultEl.textContent = 'Buying...';
             addLog(`${name} is attempting to buy a ticket...`, 'warn');
 
+            const startTime = performance.now();
             try {
                 const resp = await fetch('/api/buy', {
                     method: 'POST',
@@ -472,13 +507,15 @@
                     body: JSON.stringify({ buyer_name: name })
                 });
                 const data = await resp.json();
+                const latency = performance.now() - startTime;
                 const type = data.success ? 'success' : 'failure';
-                setResult(name, data.success, data.message);
+                setResult(nameId, data.success, data.message);
                 const portInfo = data.routed_to_port ? ` [routed→:${data.routed_to_port}]` : '';
-                addLog(`${name}: ${data.message}${portInfo}`, type);
+                addLog(`${name}: ${data.message}${portInfo} (${latency.toFixed(0)}ms)`, type);
             } catch (e) {
-                setResult(name, false, 'Network error');
-                addLog(`${name}: Network error — ${e.message}`, 'failure');
+                const latency = performance.now() - startTime;
+                setResult(nameId, false, 'Network error');
+                addLog(`${name}: Network error — ${e.message} (${latency.toFixed(0)}ms)`, 'failure');
             }
 
             btn.disabled = false;
@@ -501,30 +538,121 @@
                 el.textContent = 'Buying...';
             });
 
-            // Fire all 3 at the exact same moment
-            const requests = ['Alice', 'Bob', 'Alex'].map(name =>
-                fetch('/api/buy', {
+            const startTimes = {};
+            const latencies = {};
+
+            const requests = ['Alice', 'Bob', 'Alex'].map(name => {
+                startTimes[name] = performance.now();
+                return fetch('/api/buy', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ buyer_name: name })
                 }).then(r => r.json()).then(data => {
+                    const latency = performance.now() - startTimes[name];
+                    latencies[name] = latency;
                     const type = data.success ? 'success' : 'failure';
                     setResult(name, data.success, data.message);
                     const portInfo = data.routed_to_port ? ` [routed→:${data.routed_to_port}]` : '';
-                    addLog(`${name}: ${data.message}${portInfo}`, type);
+                    addLog(`${name}: ${data.message}${portInfo} (${latency.toFixed(0)}ms)`, type);
                     return data;
                 }).catch(e => {
+                    const latency = performance.now() - startTimes[name];
+                    latencies[name] = latency;
                     setResult(name, false, 'Network error');
-                    addLog(`${name}: Network error — ${e.message}`, 'failure');
-                })
-            );
+                    addLog(`${name}: Network error — ${e.message} (${latency.toFixed(0)}ms)`, 'failure');
+                });
+            });
 
             await Promise.all(requests);
 
+            // Calculate max latency
+            let maxName = '';
+            let maxLatency = 0;
+            for (const [name, lat] of Object.entries(latencies)) {
+                if (lat > maxLatency) {
+                    maxLatency = lat;
+                    maxName = name;
+                }
+            }
+
             // Summary
             addLog('━━━ Disaster simulation complete. Check results above. ━━━', 'info');
+            addLog(`⏱️ HIGHEST LATENCY: ${maxName} waited ${maxLatency.toFixed(0)}ms`, 'warn');
             refreshCount();
             btn.disabled = false;
+        }
+
+        // ─── Simulate Disaster (more users) ───
+        async function simulateDisasterMore() {
+            const btn = document.getElementById('disaster-btn');
+            btn.disabled = true;
+            clearResults();
+
+            addLog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'warn');
+            addLog('💥 LOAD SIMULATION — Firing 30 requests simultaneously!', 'warn');
+            addLog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'warn');
+
+            let requests = [];
+            const startTimes = {};
+            const latencies = {};
+
+            for (let i = 1; i <= 30; i++) {
+                let name = `User ${i}`;
+                let nameId = `user${i}`;
+                const el = document.getElementById(`result-${nameId}`);
+                el.className = 'user-result pending';
+                el.textContent = 'Buying...';
+
+                startTimes[name] = performance.now();
+                let req = fetch('/api/buy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ buyer_name: name })
+                }).then(r => r.json()).then(data => {
+                    const latency = performance.now() - startTimes[name];
+                    latencies[name] = latency;
+                    const type = data.success ? 'success' : 'failure';
+                    setResult(nameId, data.success, data.message);
+                    const portInfo = data.routed_to_port ? ` [routed→:${data.routed_to_port}]` : '';
+                    addLog(`${name}: ${data.message}${portInfo} (${latency.toFixed(0)}ms)`, type);
+                    return data;
+                }).catch(e => {
+                    const latency = performance.now() - startTimes[name];
+                    latencies[name] = latency;
+                    setResult(nameId, false, 'Network error');
+                    addLog(`${name}: Network error — ${e.message} (${latency.toFixed(0)}ms)`, 'failure');
+                });
+                requests.push(req);
+            }
+
+            await Promise.all(requests);
+
+            let maxName = '';
+            let maxLatency = 0;
+            for (const [name, lat] of Object.entries(latencies)) {
+                if (lat > maxLatency) {
+                    maxLatency = lat;
+                    maxName = name;
+                }
+            }
+
+            addLog('━━━ Load simulation complete. Check results above. ━━━', 'info');
+            addLog(`⏱️ HIGHEST LATENCY: ${maxName} waited ${maxLatency.toFixed(0)}ms`, 'warn');
+            refreshCount();
+            btn.disabled = false;
+        }
+
+        // ─── Reset Database (more) ───
+        async function resetDatabaseMore() {
+            try {
+                clearResults();
+                const resp = await fetch('/api/reset-more', { method: 'POST' });
+                const data = await resp.json();
+                addLog(`🔄 ${data.message}`, 'info');
+                refreshCount();
+            } catch (e) {
+                addLog(`Reset error: ${e.message}`, 'failure');
+            }
         }
 
         // ─── Reset Database ───

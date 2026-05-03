@@ -10,12 +10,13 @@ import uuid
 import ticket_pb2
 import ticket_pb2_grpc
 import os
+import argparse
 
 app = Flask(__name__)
 
 GRPC_PORTS = [50051, 50052, 50053]
 DB_FILE = os.path.join(os.path.dirname(__file__), '..', 'database.txt')
-
+more_users = False
 
 def get_random_stub():
     port = random.choice(GRPC_PORTS)
@@ -23,11 +24,9 @@ def get_random_stub():
     stub = ticket_pb2_grpc.TicketServiceStub(channel)
     return stub, port
 
-
 @app.route('/')
 def index():
-    return render_template('index.html')
-
+    return render_template('index.html', more_users=more_users)
 
 @app.route('/api/ticket-count', methods=['GET'])
 def ticket_count():
@@ -37,7 +36,6 @@ def ticket_count():
         return jsonify({'count': count})
     except Exception as e:
         return jsonify({'count': -1, 'error': str(e)}), 500
-
 
 @app.route('/api/buy', methods=['POST'])
 def buy_ticket():
@@ -65,7 +63,6 @@ def buy_ticket():
             'buyer_name': buyer_name
         }), 500
 
-
 @app.route('/api/reset', methods=['POST'])
 def reset_database():
     try:
@@ -75,6 +72,23 @@ def reset_database():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+@app.route('/api/reset-more', methods=['POST'])
+def reset_database_more():
+    try:
+        with open(DB_FILE, 'w') as f:
+            f.write('30')
+        return jsonify({'success': True, 'message': 'Database reset to 30 tickets.'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-more', action='store_true', help='Enable more users mode')
+    parser.add_argument('-nodes', type=int, help='Number of nodes')
+    args = parser.parse_args()
+    more_users = args.more
+    num_nodes = args.nodes
+    if more_users:
+        GRPC_PORTS = [50051 + i for i in range(num_nodes)]
+    
     app.run(debug=True, port=5000)

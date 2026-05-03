@@ -25,19 +25,22 @@ import java.util.concurrent.locks.ReentrantLock;
 public class ServerNode {
 
     // ─── Cluster topology ───
-    private static final int[] ALL_PORTS = {50051, 50052, 50053};
+    private final int[] allPorts;
     private static final String DB_FILE  = "../database.txt";
 
     // ─── Instance state ───
     private final int port;
     private final boolean syncMode;
-    private volatile int leaderPort = -1;
+    private final int numLeaders;
+    private final boolean useMutex;
+    private volatile List<Integer> leaderPorts = new ArrayList<>();
 
     // Local mutex for file access within this JVM
     private final ReentrantLock localLock = new ReentrantLock();
 
     // Distributed lock state (used when this node is the leader)
-    private final ReentrantLock distributedLock = new ReentrantLock();
+    private final ReentrantLock distributedLock = new ReentrantLock(); // the 300ms funnel lock
+    private final ReentrantLock distributedMutexInternalLock = new ReentrantLock(); // serializes access to the distributed mutex algorithm on the same node
 
     // Lock grant tracking — other nodes' permission for this leader to proceed
     private final Map<Integer, Boolean> lockGrants = new ConcurrentHashMap<>();
@@ -49,8 +52,9 @@ public class ServerNode {
 
     // ─── FIX 2: Real Mutex — actual lock state on each peer ───
     private volatile boolean lockHeldByRemote = false;
+    private volatile boolean lockHeldByLocal = false;
     private int lockHolderPort = -1;
-    private final Object mutexStateLock = new Object(); // guards lockHeldByRemote & lockHolderPort
+    private final Object mutexStateLock = new Object(); // guards lockHeldByRemote & lockHeldByLocal & lockHolderPort
 
     // ─── FIX 3: Idempotency — cache of processed request IDs ───
     private final ConcurrentHashMap<String, BuyTicketResponse> processedRequests = new ConcurrentHashMap<>();
@@ -64,9 +68,15 @@ public class ServerNode {
         return t;
     });
 
-    public ServerNode(int port, boolean syncMode) {
+    public ServerNode(int port, boolean syncMode, int numLeaders, boolean useMutex, int numNodes) {
         this.port = port;
         this.syncMode = syncMode;
+        this.numLeaders = numLeaders;
+        this.useMutex = useMutex;
+        this.allPorts = new int[numNodes];
+        for (int i = 0; i < numNodes; i++) {
+            this.allPorts[i] = 50051 + i;
+        }
     }
 
     // ════════════════════════════════════════════════════════
@@ -79,9 +89,22 @@ public class ServerNode {
         }
 
         int port = Integer.parseInt(args[0]);
-        boolean syncMode = args.length > 1 && args[1].equals("-sync");
+        boolean syncMode = false;
+        boolean useMutex = false;
+        int numLeaders = 1;
+        int numNodes = 3;
 
-        ServerNode node = new ServerNode(port, syncMode);
+        for (int i = 1; i < args.length; i++) {
+            if (args[i].equals("-sync")) syncMode = true;
+            else if (args[i].equals("-mutex")) useMutex = true;
+            else if (args[i].startsWith("-leaders=")) {
+                numLeaders = Integer.parseInt(args[i].substring(9));
+            } else if (args[i].startsWith("-nodes=")) {
+                numNodes = Integer.parseInt(args[i].substring(7));
+            }
+        }
+
+        ServerNode node = new ServerNode(port, syncMode, numLeaders, useMutex, numNodes);
         node.start();
     }
 
@@ -115,9 +138,10 @@ public class ServerNode {
     private void runLeaderElection() {
         System.out.println("[ELECTION] Starting leader election...");
 
-        int lowestRespondingPort = this.port;
+        List<Integer> respondingPorts = new ArrayList<>();
+        respondingPorts.add(this.port);
 
-        for (int peerPort : ALL_PORTS) {
+        for (int peerPort : allPorts) {
             if (peerPort == this.port) continue;
             try {
                 ManagedChannel channel = ManagedChannelBuilder
@@ -133,8 +157,8 @@ public class ServerNode {
                                 .setCandidatePort(this.port)
                                 .build());
 
-                if (resp.getAccepted() && peerPort < lowestRespondingPort) {
-                    lowestRespondingPort = peerPort;
+                if (resp.getAccepted()) {
+                    respondingPorts.add(peerPort);
                 }
                 channel.shutdown();
             } catch (Exception e) {
@@ -142,12 +166,13 @@ public class ServerNode {
             }
         }
 
-        this.leaderPort = lowestRespondingPort;
+        Collections.sort(respondingPorts);
+        leaderPorts = respondingPorts.subList(0, Math.min(numLeaders, respondingPorts.size()));
 
-        if (this.leaderPort == this.port) {
-            System.out.println("★★★ [ELECTION] I am the LEADER (port " + port + ") ★★★");
+        if (leaderPorts.contains(this.port)) {
+            System.out.println("★★★ [ELECTION] I am a LEADER (port " + port + ") ★★★");
         } else {
-            System.out.println("[ELECTION] Leader is node on port " + leaderPort);
+            System.out.println("[ELECTION] Leaders are " + leaderPorts);
         }
 
         // Reset heartbeat failure counter after election
@@ -165,20 +190,22 @@ public class ServerNode {
         });
 
         heartbeatScheduler.scheduleAtFixedRate(() -> {
-            if (leaderPort == this.port) {
-                // I am the leader, no need to monitor myself
+            if (leaderPorts.contains(this.port)) {
+                // I am a leader, no need to monitor myself
                 return;
             }
-            if (leaderPort == -1) {
+            if (leaderPorts.isEmpty()) {
                 // No leader known, trigger election
                 System.out.println("[HEARTBEAT] No leader known, triggering election...");
                 runLeaderElection();
                 return;
             }
 
+            int targetLeader = leaderPorts.get(0);
+
             try {
                 ManagedChannel channel = ManagedChannelBuilder
-                        .forAddress("localhost", leaderPort)
+                        .forAddress("localhost", targetLeader)
                         .usePlaintext()
                         .build();
                 TicketServiceGrpc.TicketServiceBlockingStub stub =
@@ -197,7 +224,7 @@ public class ServerNode {
                 }
             } catch (Exception e) {
                 int failures = heartbeatFailures.incrementAndGet();
-                System.out.println("[HEARTBEAT] ❌ Leader " + leaderPort + " unreachable ("
+                System.out.println("[HEARTBEAT] ❌ Leader " + targetLeader + " unreachable ("
                         + failures + "/" + MAX_HEARTBEAT_FAILURES + " failures)");
 
                 if (failures >= MAX_HEARTBEAT_FAILURES) {
@@ -215,8 +242,14 @@ public class ServerNode {
     //  DATABASE I/O
     // ════════════════════════════════════════════════════════
     private int readTicketCount() throws IOException {
-        String content = new String(Files.readAllBytes(Paths.get(DB_FILE))).trim();
-        return Integer.parseInt(content);
+        for (int i = 0; i < 10; i++) {
+            String content = new String(Files.readAllBytes(Paths.get(DB_FILE))).trim();
+            if (!content.isEmpty()) {
+                return Integer.parseInt(content);
+            }
+            try { Thread.sleep(5); } catch (InterruptedException e) {}
+        }
+        return 0; // Fallback
     }
 
     private void writeTicketCount(int count) throws IOException {
@@ -230,11 +263,25 @@ public class ServerNode {
     private boolean acquireDistributedLock() {
         System.out.println("[MUTEX] Requesting distributed lock from peers...");
 
-        int maxRetries = 3;
+        int maxRetries = 50;
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            boolean mustWait = false;
+            synchronized (mutexStateLock) {
+                if (lockHeldByRemote) {
+                    mustWait = true;
+                } else {
+                    lockHeldByLocal = true;
+                }
+            }
+
+            if (mustWait) {
+                try { Thread.sleep((long) (Math.random() * 100) + 50); } catch (Exception e) {}
+                continue; // Someone else holds it locally, wait and retry
+            }
+
             boolean allGranted = true;
 
-            for (int peerPort : ALL_PORTS) {
+            for (int peerPort : allPorts) {
                 if (peerPort == this.port) continue;
                 try {
                     ManagedChannel channel = ManagedChannelBuilder
@@ -243,26 +290,23 @@ public class ServerNode {
                             .build();
                     TicketServiceGrpc.TicketServiceBlockingStub stub =
                             TicketServiceGrpc.newBlockingStub(channel)
-                                    .withDeadlineAfter(5, TimeUnit.SECONDS);
+                                    .withDeadlineAfter(2, TimeUnit.SECONDS);
 
                     LockResponse resp = stub.requestLock(
                             LockRequest.newBuilder()
                                     .setRequesterPort(this.port)
                                     .build());
 
-                    lockGrants.put(peerPort, resp.getGranted());
                     channel.shutdown();
 
                     if (!resp.getGranted()) {
                         System.out.println("[MUTEX] Lock DENIED by peer " + peerPort
                                 + " (attempt " + attempt + "/" + maxRetries + ")");
                         allGranted = false;
-                        break; // No point asking more peers if one denied
+                        break; 
                     }
-                    System.out.println("[MUTEX] Lock GRANTED by peer " + peerPort);
                 } catch (Exception e) {
-                    System.out.println("[MUTEX] Peer " + peerPort + " unreachable — DENIED (safe default).");
-                    lockGrants.put(peerPort, false);
+                    System.out.println("[MUTEX] Peer " + peerPort + " unreachable — DENIED.");
                     allGranted = false;
                     break;
                 }
@@ -278,7 +322,7 @@ public class ServerNode {
 
             if (attempt < maxRetries) {
                 try {
-                    long backoff = 200L * attempt; // Exponential-ish backoff
+                    long backoff = (long) (Math.random() * 150) + 50; 
                     System.out.println("[MUTEX] Retrying in " + backoff + "ms...");
                     Thread.sleep(backoff);
                 } catch (InterruptedException ie) {
@@ -293,8 +337,11 @@ public class ServerNode {
     }
 
     private void releaseDistributedLock() {
+        synchronized (mutexStateLock) {
+            lockHeldByLocal = false;
+        }
         System.out.println("[MUTEX] Releasing distributed lock...");
-        for (int peerPort : ALL_PORTS) {
+        for (int peerPort : allPorts) {
             if (peerPort == this.port) continue;
             try {
                 ManagedChannel channel = ManagedChannelBuilder
@@ -379,7 +426,7 @@ public class ServerNode {
         }
 
         private void handleBuySynchronized(String buyer, String requestId, StreamObserver<BuyTicketResponse> responseObserver) {
-            if (leaderPort == -1) {
+            if (leaderPorts.isEmpty()) {
                 // Election hasn't completed yet
                 responseObserver.onNext(BuyTicketResponse.newBuilder()
                         .setSuccess(false)
@@ -391,17 +438,18 @@ public class ServerNode {
                 return;
             }
 
-            if (leaderPort != port) {
+            if (!leaderPorts.contains(port)) {
                 // ── FOLLOWER: forward to leader ──
-                System.out.println("[SYNC] I am a FOLLOWER. Forwarding " + buyer + "'s request to Leader (port " + leaderPort + ")...");
+                int targetLeader = leaderPorts.get(new Random().nextInt(leaderPorts.size()));
+                System.out.println("[SYNC] I am a FOLLOWER. Forwarding " + buyer + "'s request to Leader (port " + targetLeader + ")...");
                 try {
                     ManagedChannel channel = ManagedChannelBuilder
-                            .forAddress("localhost", leaderPort)
+                            .forAddress("localhost", targetLeader)
                             .usePlaintext()
                             .build();
                     TicketServiceGrpc.TicketServiceBlockingStub stub =
                             TicketServiceGrpc.newBlockingStub(channel)
-                                    .withDeadlineAfter(10, TimeUnit.SECONDS);
+                                    .withDeadlineAfter(20, TimeUnit.SECONDS);
 
                     ForwardBuyResponse fwdResp = stub.forwardBuy(
                             ForwardBuyRequest.newBuilder()
@@ -429,7 +477,7 @@ public class ServerNode {
                             .asRuntimeException());
                 }
             } else {
-                // ── LEADER: process with distributed mutex ──
+                // ── LEADER: process ──
                 processWithMutex(buyer, requestId, responseObserver);
             }
         }
@@ -446,69 +494,88 @@ public class ServerNode {
                 }
             }
 
-            System.out.println("[LEADER] Processing " + buyer + "'s request with distributed mutex...");
+            System.out.println("[LEADER] Processing " + buyer + "'s request...");
 
-            // Acquire the local lock first (serializes requests within this JVM)
+            // 1. Acquire the local lock first (serializes requests within this JVM - bottleneck!)
             distributedLock.lock();
             try {
-                // Acquire distributed lock from peers
-                boolean locked = acquireDistributedLock();
-                if (!locked) {
-                    responseObserver.onNext(BuyTicketResponse.newBuilder()
-                            .setSuccess(false)
-                            .setMessage("Failed: Could not acquire distributed lock for " + buyer + ".")
-                            .setRemainingTickets(-1)
-                            .setServedByPort(port)
-                            .build());
-                    responseObserver.onCompleted();
-                    return;
-                }
-
-                // Critical section: read → sleep → write
-                int tickets = readTicketCount();
-                System.out.println("[LEADER] 🔒 " + buyer + ": Read ticket count = " + tickets);
-
-                System.out.println("[LEADER] 🔒 " + buyer + ": Sleeping 500ms (inside critical section)...");
-                Thread.sleep(500);
-
-                BuyTicketResponse response;
-                if (tickets > 0) {
-                    int newCount = tickets - 1;
-                    writeTicketCount(newCount);
-                    System.out.println("[LEADER] ✅ " + buyer + ": BOUGHT ticket! Wrote count = " + newCount);
-
-                    response = BuyTicketResponse.newBuilder()
-                            .setSuccess(true)
-                            .setMessage("Success: Ticket bought by " + buyer + "!")
-                            .setRemainingTickets(newCount)
-                            .setServedByPort(port)
-                            .build();
-                } else {
-                    System.out.println("[LEADER] ❌ " + buyer + ": SOLD OUT.");
-                    response = BuyTicketResponse.newBuilder()
-                            .setSuccess(false)
-                            .setMessage("Failed: Sold Out! No tickets left for " + buyer + ".")
-                            .setRemainingTickets(0)
-                            .setServedByPort(port)
-                            .build();
-                }
-
-                // FIX 3: Cache the response for idempotency
-                if (requestId != null && !requestId.isEmpty()) {
-                    processedRequests.put(requestId, response);
-                }
-
-                responseObserver.onNext(response);
-                responseObserver.onCompleted();
-
-                // Release distributed lock
-                releaseDistributedLock();
-
-            } catch (Exception e) {
-                System.err.println("[ERROR] " + e.getMessage());
-                responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
-            } finally {
+                System.out.println("[LEADER] ⌛ " + buyer + ": Heavy local processing (300ms bottleneck)...");
+                Thread.sleep(300);
+            } catch (Exception e) {} finally {
                 distributedLock.unlock();
+            }
+
+            // 2. Distributed Critical Section
+            if (useMutex) {
+                distributedMutexInternalLock.lock();
+            }
+            try {
+                if (useMutex) {
+                    // Acquire distributed lock from peers
+                    boolean locked = acquireDistributedLock();
+                    if (!locked) {
+                        responseObserver.onNext(BuyTicketResponse.newBuilder()
+                                .setSuccess(false)
+                                .setMessage("Failed: Could not acquire distributed lock for " + buyer + ".")
+                                .setRemainingTickets(-1)
+                                .setServedByPort(port)
+                                .build());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+                }
+
+                try {
+                    // Critical section: read → sleep → write
+                    int tickets = readTicketCount();
+                    System.out.println("[LEADER] 🔒 " + buyer + ": Read ticket count = " + tickets);
+
+                    // 3. Artificially widen the race condition window so it happens reliably without mutex!
+                    Thread.sleep(30);
+
+                    BuyTicketResponse response;
+                    if (tickets > 0) {
+                        int newCount = tickets - 1;
+                        writeTicketCount(newCount);
+                        System.out.println("[LEADER] ✅ " + buyer + ": BOUGHT ticket! Wrote count = " + newCount);
+
+                        response = BuyTicketResponse.newBuilder()
+                                .setSuccess(true)
+                                .setMessage("Success: Ticket bought by " + buyer + "!")
+                                .setRemainingTickets(newCount)
+                                .setServedByPort(port)
+                                .build();
+                    } else {
+                        System.out.println("[LEADER] ❌ " + buyer + ": SOLD OUT.");
+                        response = BuyTicketResponse.newBuilder()
+                                .setSuccess(false)
+                                .setMessage("Failed: Sold Out! No tickets left for " + buyer + ".")
+                                .setRemainingTickets(0)
+                                .setServedByPort(port)
+                                .build();
+                    }
+
+                    // FIX 3: Cache the response for idempotency
+                    if (requestId != null && !requestId.isEmpty()) {
+                        processedRequests.put(requestId, response);
+                    }
+
+                    responseObserver.onNext(response);
+                    responseObserver.onCompleted();
+
+                } catch (Exception e) {
+                    System.err.println("[ERROR] " + e.getMessage());
+                    responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+                } finally {
+                    if (useMutex) {
+                        // Release distributed lock
+                        releaseDistributedLock();
+                    }
+                }
+            } finally {
+                if (useMutex) {
+                    distributedMutexInternalLock.unlock();
+                }
             }
         }
 
@@ -537,13 +604,11 @@ public class ServerNode {
                     .build());
             responseObserver.onCompleted();
 
-            // Update our own leader view: lowest port wins
-            if (leaderPort == -1) {
-                leaderPort = Math.min(port, candidatePort);
-                if (leaderPort == port) {
-                    System.out.println("★★★ [ELECTION] I am the LEADER (port " + port + ") ★★★");
-                } else {
-                    System.out.println("[ELECTION] Leader is node on port " + leaderPort);
+            // Update our own leader view (not strictly necessary since we elect independently)
+            if (leaderPorts.isEmpty()) {
+                leaderPorts.add(Math.min(port, candidatePort));
+                if (leaderPorts.contains(port)) {
+                    System.out.println("★★★ [ELECTION] I am a LEADER (port " + port + ") ★★★");
                 }
             }
         }
@@ -568,60 +633,78 @@ public class ServerNode {
                 }
             }
 
-            // Process with mutex, but return via ForwardBuyResponse
+            // Process, return via ForwardBuyResponse
             distributedLock.lock();
             try {
-                boolean locked = acquireDistributedLock();
-                if (!locked) {
-                    responseObserver.onNext(ForwardBuyResponse.newBuilder()
-                            .setSuccess(false)
-                            .setMessage("Failed: Could not acquire distributed lock for " + buyer + ".")
-                            .setRemainingTickets(-1)
-                            .build());
-                    responseObserver.onCompleted();
-                    return;
-                }
-
-                int tickets = readTicketCount();
-                System.out.println("[LEADER] 🔒 " + buyer + ": Read ticket count = " + tickets);
-
-                System.out.println("[LEADER] 🔒 " + buyer + ": Sleeping 500ms (inside critical section)...");
-                Thread.sleep(500);
-
-                ForwardBuyResponse response;
-                if (tickets > 0) {
-                    int newCount = tickets - 1;
-                    writeTicketCount(newCount);
-                    System.out.println("[LEADER] ✅ " + buyer + ": BOUGHT ticket! Wrote count = " + newCount);
-
-                    response = ForwardBuyResponse.newBuilder()
-                            .setSuccess(true)
-                            .setMessage("Success: Ticket bought by " + buyer + "!")
-                            .setRemainingTickets(newCount)
-                            .build();
-                } else {
-                    System.out.println("[LEADER] ❌ " + buyer + ": SOLD OUT.");
-                    response = ForwardBuyResponse.newBuilder()
-                            .setSuccess(false)
-                            .setMessage("Failed: Sold Out! No tickets left for " + buyer + ".")
-                            .setRemainingTickets(0)
-                            .build();
-                }
-
-                // FIX 3: Cache the forward response
-                if (requestId != null && !requestId.isEmpty()) {
-                    processedForwards.put(requestId, response);
-                }
-
-                responseObserver.onNext(response);
-                responseObserver.onCompleted();
-                releaseDistributedLock();
-
-            } catch (Exception e) {
-                System.err.println("[ERROR] " + e.getMessage());
-                responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
-            } finally {
+                System.out.println("[LEADER] ⌛ " + buyer + ": Heavy local processing (300ms bottleneck)...");
+                Thread.sleep(300);
+            } catch (Exception e) {} finally {
                 distributedLock.unlock();
+            }
+
+            if (useMutex) {
+                distributedMutexInternalLock.lock();
+            }
+            try {
+                if (useMutex) {
+                    boolean locked = acquireDistributedLock();
+                    if (!locked) {
+                        responseObserver.onNext(ForwardBuyResponse.newBuilder()
+                                .setSuccess(false)
+                                .setMessage("Failed: Could not acquire distributed lock for " + buyer + ".")
+                                .setRemainingTickets(-1)
+                                .build());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+                }
+
+                try {
+                    int tickets = readTicketCount();
+                    System.out.println("[LEADER] 🔒 " + buyer + ": Read ticket count = " + tickets);
+
+                    // Race condition window
+                    Thread.sleep(30);
+
+                    ForwardBuyResponse response;
+                    if (tickets > 0) {
+                        int newCount = tickets - 1;
+                        writeTicketCount(newCount);
+                        System.out.println("[LEADER] ✅ " + buyer + ": BOUGHT ticket! Wrote count = " + newCount);
+
+                        response = ForwardBuyResponse.newBuilder()
+                                .setSuccess(true)
+                                .setMessage("Success: Ticket bought by " + buyer + "!")
+                                .setRemainingTickets(newCount)
+                                .build();
+                    } else {
+                        System.out.println("[LEADER] ❌ " + buyer + ": SOLD OUT.");
+                        response = ForwardBuyResponse.newBuilder()
+                                .setSuccess(false)
+                                .setMessage("Failed: Sold Out! No tickets left for " + buyer + ".")
+                                .setRemainingTickets(0)
+                                .build();
+                    }
+
+                    // FIX 3: Cache the forward response
+                    if (requestId != null && !requestId.isEmpty()) {
+                        processedForwards.put(requestId, response);
+                    }
+
+                    responseObserver.onNext(response);
+                    responseObserver.onCompleted();
+                } catch (Exception e) {
+                    System.err.println("[ERROR] " + e.getMessage());
+                    responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+                } finally {
+                    if (useMutex) {
+                        releaseDistributedLock();
+                    }
+                }
+            } finally {
+                if (useMutex) {
+                    distributedMutexInternalLock.unlock();
+                }
             }
         }
 
@@ -631,14 +714,14 @@ public class ServerNode {
         public void requestLock(LockRequest request, StreamObserver<LockResponse> responseObserver) {
             int requester = request.getRequesterPort();
             synchronized (mutexStateLock) {
-                if (!lockHeldByRemote) {
+                if (!lockHeldByRemote && !lockHeldByLocal) {
                     lockHeldByRemote = true;
                     lockHolderPort = requester;
                     System.out.println("[MUTEX] Lock requested by port " + requester + " — GRANTED.");
                     responseObserver.onNext(LockResponse.newBuilder().setGranted(true).build());
                 } else {
                     System.out.println("[MUTEX] Lock requested by port " + requester
-                            + " — DENIED (held by port " + lockHolderPort + ").");
+                            + " — DENIED.");
                     responseObserver.onNext(LockResponse.newBuilder().setGranted(false).build());
                 }
             }
@@ -655,9 +738,6 @@ public class ServerNode {
                     lockHeldByRemote = false;
                     lockHolderPort = -1;
                     System.out.println("[MUTEX] Lock released by port " + requester + ".");
-                } else {
-                    System.out.println("[MUTEX] Release request from port " + requester
-                            + " ignored (lock held by " + lockHolderPort + ").");
                 }
             }
             responseObserver.onNext(UnlockResponse.newBuilder().setReleased(true).build());
@@ -670,7 +750,7 @@ public class ServerNode {
         public void heartbeat(HeartbeatRequest request, StreamObserver<HeartbeatResponse> responseObserver) {
             responseObserver.onNext(HeartbeatResponse.newBuilder()
                     .setAlive(true)
-                    .setLeaderPort(leaderPort)
+                    .setLeaderPort(leaderPorts.isEmpty() ? -1 : leaderPorts.get(0))
                     .build());
             responseObserver.onCompleted();
         }
