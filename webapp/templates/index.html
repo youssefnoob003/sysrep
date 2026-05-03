@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flash Sale — Distributed Ticket Booking</title>
+    <meta name="description" content="Distributed systems demo: race conditions vs leader election and distributed mutex.">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: #1a1a2e;
+            --bg-card-hover: #1f1f35;
+            --accent-cyan: #00d4ff;
+            --accent-magenta: #ff006e;
+            --accent-green: #00ff88;
+            --accent-amber: #ffbe0b;
+            --accent-red: #ff4444;
+            --text-primary: #e8e8f0;
+            --text-secondary: #8888a0;
+            --text-dim: #555570;
+            --border-color: #2a2a40;
+            --glass-bg: rgba(26, 26, 46, 0.7);
+            --glass-border: rgba(255, 255, 255, 0.06);
+            --shadow-glow-cyan: 0 0 30px rgba(0, 212, 255, 0.15);
+            --shadow-glow-red: 0 0 30px rgba(255, 0, 110, 0.2);
+            --radius: 16px;
+            --radius-sm: 10px;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        body::before {
+            content: '';
+            position: fixed;
+            top: -50%; left: -50%;
+            width: 200%; height: 200%;
+            background: radial-gradient(circle at 30% 20%, rgba(0,212,255,0.04) 0%, transparent 50%),
+                        radial-gradient(circle at 70% 80%, rgba(255,0,110,0.03) 0%, transparent 50%);
+            z-index: -1;
+            animation: bgShift 20s ease-in-out infinite alternate;
+        }
+        @keyframes bgShift {
+            0% { transform: translate(0, 0) rotate(0deg); }
+            100% { transform: translate(-5%, -3%) rotate(3deg); }
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 30px 20px;
+        }
+
+        /* ─── Header ─── */
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .header h1 {
+            font-size: 2.4rem;
+            font-weight: 900;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -1px;
+        }
+        .header p {
+            color: var(--text-secondary);
+            margin-top: 6px;
+            font-size: 0.95rem;
+        }
+
+        /* ─── Ticket Counter ─── */
+        .ticket-counter {
+            background: var(--glass-bg);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius);
+            padding: 30px;
+            text-align: center;
+            margin-bottom: 25px;
+            backdrop-filter: blur(20px);
+            box-shadow: var(--shadow-glow-cyan);
+            position: relative;
+            overflow: hidden;
+        }
+        .ticket-counter::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
+        }
+        .ticket-counter .label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            font-weight: 600;
+        }
+        .ticket-counter .count {
+            font-size: 5rem;
+            font-weight: 900;
+            color: var(--accent-cyan);
+            line-height: 1.1;
+            margin: 8px 0;
+            text-shadow: 0 0 40px rgba(0,212,255,0.3);
+            transition: all 0.4s ease;
+        }
+        .ticket-counter .count.danger {
+            color: var(--accent-red);
+            text-shadow: 0 0 40px rgba(255,68,68,0.4);
+        }
+        .ticket-counter .count.sold-out {
+            color: var(--text-dim);
+        }
+        .ticket-counter .sublabel {
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        /* ─── User Cards Grid ─── */
+        .users-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 25px;
+        }
+        .user-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 24px;
+            text-align: center;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        .user-card:hover {
+            background: var(--bg-card-hover);
+            transform: translateY(-2px);
+            border-color: rgba(255,255,255,0.1);
+        }
+        .user-avatar {
+            width: 56px; height: 56px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            margin: 0 auto 12px;
+            font-weight: 700;
+            color: white;
+        }
+        .user-card:nth-child(1) .user-avatar { background: linear-gradient(135deg, #667eea, #764ba2); }
+        .user-card:nth-child(2) .user-avatar { background: linear-gradient(135deg, #f093fb, #f5576c); }
+        .user-card:nth-child(3) .user-avatar { background: linear-gradient(135deg, #4facfe, #00f2fe); }
+        .user-name {
+            font-size: 1.1rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+        .user-port {
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            margin-bottom: 14px;
+        }
+        .buy-btn {
+            width: 100%;
+            padding: 10px 16px;
+            border: none;
+            border-radius: var(--radius-sm);
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.25s ease;
+            background: linear-gradient(135deg, var(--accent-cyan), #0090b3);
+            color: white;
+            letter-spacing: 0.5px;
+        }
+        .buy-btn:hover { transform: scale(1.03); filter: brightness(1.15); }
+        .buy-btn:active { transform: scale(0.97); }
+        .buy-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+            transform: none;
+            filter: none;
+        }
+        .user-result {
+            margin-top: 12px;
+            padding: 8px;
+            border-radius: var(--radius-sm);
+            font-size: 0.8rem;
+            font-weight: 600;
+            min-height: 34px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+        }
+        .user-result.success {
+            background: rgba(0, 255, 136, 0.1);
+            color: var(--accent-green);
+            border: 1px solid rgba(0, 255, 136, 0.2);
+        }
+        .user-result.failure {
+            background: rgba(255, 68, 68, 0.1);
+            color: var(--accent-red);
+            border: 1px solid rgba(255, 68, 68, 0.2);
+        }
+        .user-result.pending {
+            background: rgba(255, 190, 11, 0.1);
+            color: var(--accent-amber);
+            border: 1px solid rgba(255, 190, 11, 0.2);
+        }
+
+        /* ─── Action Buttons ─── */
+        .actions {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 25px;
+        }
+        .disaster-btn {
+            flex: 2;
+            padding: 16px 24px;
+            border: none;
+            border-radius: var(--radius);
+            font-family: 'Inter', sans-serif;
+            font-weight: 800;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: linear-gradient(135deg, var(--accent-magenta), #cc0058);
+            color: white;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            box-shadow: var(--shadow-glow-red);
+            position: relative;
+            overflow: hidden;
+        }
+        .disaster-btn::after {
+            content: '';
+            position: absolute;
+            top: -50%; left: -50%;
+            width: 200%; height: 200%;
+            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 60%);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        .disaster-btn:hover::after { opacity: 1; }
+        .disaster-btn:hover { transform: translateY(-2px); filter: brightness(1.1); }
+        .disaster-btn:active { transform: translateY(0); }
+        .disaster-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; filter: none; }
+
+        .reset-btn {
+            flex: 1;
+            padding: 16px 24px;
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: var(--bg-card);
+            color: var(--text-secondary);
+        }
+        .reset-btn:hover {
+            border-color: var(--accent-amber);
+            color: var(--accent-amber);
+            background: rgba(255, 190, 11, 0.05);
+        }
+
+        /* ─── Log Console ─── */
+        .log-console {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+        .log-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 20px;
+            background: var(--bg-card);
+            border-bottom: 1px solid var(--border-color);
+        }
+        .log-header h3 {
+            font-size: 0.85rem;
+            font-weight: 700;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        .log-status {
+            display: flex; align-items: center; gap: 6px;
+            font-size: 0.75rem; color: var(--accent-green);
+        }
+        .log-status .dot {
+            width: 6px; height: 6px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            animation: pulse 2s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .log-body {
+            padding: 16px 20px;
+            max-height: 280px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.78rem;
+            line-height: 1.8;
+        }
+        .log-body::-webkit-scrollbar { width: 4px; }
+        .log-body::-webkit-scrollbar-track { background: transparent; }
+        .log-body::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
+        .log-entry {
+            padding: 3px 0;
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateX(-8px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        .log-entry .timestamp {
+            color: var(--text-dim);
+            margin-right: 8px;
+        }
+        .log-entry.success { color: var(--accent-green); }
+        .log-entry.failure { color: var(--accent-red); }
+        .log-entry.info { color: var(--accent-cyan); }
+        .log-entry.warn { color: var(--accent-amber); }
+
+        /* ─── Responsive ─── */
+        @media (max-width: 700px) {
+            .users-grid { grid-template-columns: 1fr; }
+            .actions { flex-direction: column; }
+            .ticket-counter .count { font-size: 3.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>⚡ Flash Sale Ticket Booking</h1>
+            <p>Distributed Systems Demo — Race Conditions vs. Leader Election & Mutex</p>
+        </div>
+
+        <!-- Ticket Counter -->
+        <div class="ticket-counter">
+            <div class="label">VIP Tickets Remaining</div>
+            <div class="count" id="ticketCount">—</div>
+            <div class="sublabel">shared database.txt across 3 nodes</div>
+        </div>
+
+        <!-- User Cards -->
+        <div class="users-grid">
+            <div class="user-card" id="card-alice">
+                <div class="user-avatar">A</div>
+                <div class="user-name">Alice</div>
+                <div class="user-port">→ Random node</div>
+                <button class="buy-btn" id="btn-alice" onclick="buyTicket('Alice')">🎟️ Buy Ticket</button>
+                <div class="user-result" id="result-alice"></div>
+            </div>
+            <div class="user-card" id="card-bob">
+                <div class="user-avatar">B</div>
+                <div class="user-name">Bob</div>
+                <div class="user-port">→ Random node</div>
+                <button class="buy-btn" id="btn-bob" onclick="buyTicket('Bob')">🎟️ Buy Ticket</button>
+                <div class="user-result" id="result-bob"></div>
+            </div>
+            <div class="user-card" id="card-alex">
+                <div class="user-avatar">X</div>
+                <div class="user-name">Alex</div>
+                <div class="user-port">→ Random node</div>
+                <button class="buy-btn" id="btn-alex" onclick="buyTicket('Alex')">🎟️ Buy Ticket</button>
+                <div class="user-result" id="result-alex"></div>
+            </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="actions">
+            <button class="disaster-btn" id="disaster-btn" onclick="simulateDisaster()">
+                💥 Simulate Disaster — Fire All 3 Simultaneously
+            </button>
+            <button class="reset-btn" id="reset-btn" onclick="resetDatabase()">
+                🔄 Reset DB to 1
+            </button>
+        </div>
+
+        <!-- Log Console -->
+        <div class="log-console">
+            <div class="log-header">
+                <h3>📋 Event Log</h3>
+                <div class="log-status"><div class="dot"></div> Live</div>
+            </div>
+            <div class="log-body" id="logBody">
+                <div class="log-entry info"><span class="timestamp">[init]</span> System ready. Start the Java nodes and click a button.</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ─── Helpers ───
+        function now() {
+            return new Date().toLocaleTimeString('en-US', { hour12: false });
+        }
+
+        function addLog(message, type = 'info') {
+            const body = document.getElementById('logBody');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.innerHTML = `<span class="timestamp">[${now()}]</span> ${message}`;
+            body.appendChild(entry);
+            body.scrollTop = body.scrollHeight;
+        }
+
+        function setResult(name, success, message) {
+            const el = document.getElementById(`result-${name.toLowerCase()}`);
+            el.className = `user-result ${success ? 'success' : 'failure'}`;
+            el.textContent = message;
+        }
+
+        function clearResults() {
+            ['alice', 'bob', 'alex'].forEach(name => {
+                const el = document.getElementById(`result-${name}`);
+                el.className = 'user-result';
+                el.textContent = '';
+            });
+        }
+
+        // ─── Refresh Ticket Count ───
+        async function refreshCount() {
+            try {
+                const resp = await fetch('/api/ticket-count');
+                const data = await resp.json();
+                const el = document.getElementById('ticketCount');
+                el.textContent = data.count;
+                el.className = 'count';
+                if (data.count === 0) el.classList.add('sold-out');
+                else if (data.count <= 1) el.classList.add('danger');
+            } catch (e) {
+                document.getElementById('ticketCount').textContent = '?';
+            }
+        }
+
+        // ─── Buy Ticket (single user) ───
+        async function buyTicket(name) {
+            const btn = document.getElementById(`btn-${name.toLowerCase()}`);
+            const resultEl = document.getElementById(`result-${name.toLowerCase()}`);
+            btn.disabled = true;
+            resultEl.className = 'user-result pending';
+            resultEl.textContent = 'Buying...';
+            addLog(`${name} is attempting to buy a ticket...`, 'warn');
+
+            try {
+                const resp = await fetch('/api/buy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ buyer_name: name })
+                });
+                const data = await resp.json();
+                const type = data.success ? 'success' : 'failure';
+                setResult(name, data.success, data.message);
+                const portInfo = data.routed_to_port ? ` [routed→:${data.routed_to_port}]` : '';
+                addLog(`${name}: ${data.message}${portInfo}`, type);
+            } catch (e) {
+                setResult(name, false, 'Network error');
+                addLog(`${name}: Network error — ${e.message}`, 'failure');
+            }
+
+            btn.disabled = false;
+            refreshCount();
+        }
+
+        // ─── Simulate Disaster (fire all 3 at the same millisecond) ───
+        async function simulateDisaster() {
+            const btn = document.getElementById('disaster-btn');
+            btn.disabled = true;
+            clearResults();
+
+            addLog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'warn');
+            addLog('💥 DISASTER SIMULATION — Firing 3 requests simultaneously!', 'warn');
+            addLog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'warn');
+
+            ['alice', 'bob', 'alex'].forEach(name => {
+                const el = document.getElementById(`result-${name}`);
+                el.className = 'user-result pending';
+                el.textContent = 'Buying...';
+            });
+
+            // Fire all 3 at the exact same moment
+            const requests = ['Alice', 'Bob', 'Alex'].map(name =>
+                fetch('/api/buy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ buyer_name: name })
+                }).then(r => r.json()).then(data => {
+                    const type = data.success ? 'success' : 'failure';
+                    setResult(name, data.success, data.message);
+                    const portInfo = data.routed_to_port ? ` [routed→:${data.routed_to_port}]` : '';
+                    addLog(`${name}: ${data.message}${portInfo}`, type);
+                    return data;
+                }).catch(e => {
+                    setResult(name, false, 'Network error');
+                    addLog(`${name}: Network error — ${e.message}`, 'failure');
+                })
+            );
+
+            await Promise.all(requests);
+
+            // Summary
+            addLog('━━━ Disaster simulation complete. Check results above. ━━━', 'info');
+            refreshCount();
+            btn.disabled = false;
+        }
+
+        // ─── Reset Database ───
+        async function resetDatabase() {
+            try {
+                clearResults();
+                const resp = await fetch('/api/reset', { method: 'POST' });
+                const data = await resp.json();
+                addLog(`🔄 ${data.message}`, 'info');
+                refreshCount();
+            } catch (e) {
+                addLog(`Reset error: ${e.message}`, 'failure');
+            }
+        }
+
+        // ─── Auto-refresh counter every 2s ───
+        refreshCount();
+        setInterval(refreshCount, 2000);
+    </script>
+</body>
+</html>
